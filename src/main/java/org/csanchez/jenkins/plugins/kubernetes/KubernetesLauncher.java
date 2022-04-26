@@ -128,32 +128,45 @@ public class KubernetesLauncher extends JNLPLauncher {
 
             runListener = template.getListener();
 
-            LOGGER.log(FINE, () -> "Creating Pod: " + cloudName + " " + namespace + "/" + podName);
-            try {
-                pod = client.pods().inNamespace(namespace).create(pod);
-            } catch (KubernetesClientException e) {
-                Metrics.metricRegistry().counter(MetricNames.CREATION_FAILED).inc();
-                int httpCode = e.getCode();
-                if (400 <= httpCode && httpCode < 500) { // 4xx
-                    if (httpCode == 403 && e.getMessage().contains("is forbidden: exceeded quota")) {
-                        runListener.getLogger().printf("WARNING: Unable to create pod: %s %s/%s because kubernetes resource quota exceeded. %n%s%nRetrying...%n%n",
-                                cloudName, namespace, pod.getMetadata().getName(), e.getMessage());
-                    }
-                    else if (httpCode == 409 && e.getMessage().contains("Operation cannot be fulfilled on resourcequotas")) {
-                        // See: https://github.com/kubernetes/kubernetes/issues/67761 ; A retry usually works.
-                        runListener.getLogger().printf("WARNING: Unable to create pod: %s %s/%s because kubernetes resource quota update conflict. %n%s%nRetrying...%n%n",
-                                cloudName, namespace, pod.getMetadata().getName(), e.getMessage());
-                    }
-                    else {
-                        runListener.getLogger().printf("ERROR: Unable to create pod %s %s/%s.%n%s%n", cloudName, namespace, pod.getMetadata().getName(), e.getMessage());
+            LOGGER.log(INFO, () -> "Creating Pod: " + cloudName + " " + namespace + "/" + podName);
+            boolean done = false;
+            // retry for up to one minute
+            int iterationCount = 60;
+
+            while (!done && iterationCount > 0) {
+                LOGGER.log(INFO, "Create attempt ( " + (60 - iterationCount)  +"): "+ cloudName + " " + namespace + "/" + podName);
+                try {
+                    pod = client.pods().inNamespace(namespace).create(pod);
+                    done = true;
+                } catch (KubernetesClientException e) {
+                    iterationCount--;
+                    Metrics.metricRegistry().counter(MetricNames.CREATION_FAILED).inc();
+                    int httpCode = e.getCode();
+                    LOGGER.log(INFO, () -> "Caught exception: " + cloudName + " " + namespace + "/" + podName + " code: " + httpCode);
+                    if (400 <= httpCode && httpCode < 500) { // 4xx
+                        if (httpCode == 403 && e.getMessage().contains("is forbidden: exceeded quota")) {
+                            runListener.getLogger().printf("WARNING: Unable to create pod: %s %s/%s because kubernetes resource quota exceeded. %n%s%nRetrying...%n%n",
+                                    cloudName, namespace, pod.getMetadata().getName(), e.getMessage());
+                        } else if (httpCode == 409 && e.getMessage().contains("Operation cannot be fulfilled on resourcequotas")) {
+                            // See: https://github.com/kubernetes/kubernetes/issues/67761 ; A retry usually works.
+                            runListener.getLogger().printf("WARNING: Unable to create pod: %s %s/%s because kubernetes resource quota update conflict. %n%s%nRetrying...%n%n",
+                                    cloudName, namespace, pod.getMetadata().getName(), e.getMessage());
+                        } else {
+                            runListener.getLogger().printf("ERROR: Unable to create pod %s %s/%s.%n%s%n", cloudName, namespace, pod.getMetadata().getName(), e.getMessage());
+                            PodUtils.cancelQueueItemFor(pod, e.getMessage());
+                        }
+                    } else if (500 <= httpCode && httpCode < 600) { // 5xx
+                        LOGGER.log(INFO, "Kubernetes returned HTTP code {0} {1}. Retrying...", new Object[]{e.getCode(), e.getStatus()});
+                    } else {
+                        LOGGER.log(WARNING, "Kubernetes returned unhandled HTTP code {0} {1}", new Object[]{e.getCode(), e.getStatus()});
                         PodUtils.cancelQueueItemFor(pod, e.getMessage());
+                        throw e;
                     }
-                } else if (500 <= httpCode && httpCode < 600) { // 5xx
-                    LOGGER.log(FINE,"Kubernetes returned HTTP code {0} {1}. Retrying...", new Object[] {e.getCode(), e.getStatus()});
-                } else {
-                    LOGGER.log(WARNING, "Kubernetes returned unhandled HTTP code {0} {1}", new Object[] {e.getCode(), e.getStatus()});
+                    Thread.sleep(1000);
+                } catch (Throwable e) {
+                    LOGGER.log(INFO, "Caught uncaught exception: " + cloudName + " " + namespace + "/" + podName, e);
+                    throw e;
                 }
-                throw e;
             }
             LOGGER.log(INFO, () -> "Created Pod: " + cloudName + " " + namespace + "/" + podName);
             listener.getLogger().printf("Created Pod: %s %s/%s%n", cloudName, namespace, podName);
